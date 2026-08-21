@@ -21,6 +21,7 @@ SSIDや映像サーバは当日変更される可能性があります。`config
 
 - `main.py`: 映像取得、ArUco認識、地図、A*、表示、UDP送信、CSVログ
 - `planner.py`: OpenCV非依存のA*経路計画
+- `send_test_command.py`: カメラなしで機体側の基礎走行を短時間確認する安全制限付きUDP送信
 - `config.json`: 自機ID、余白、速度、IPアドレスなど
 - `requirements.txt`: Python依存パッケージ
 - `tests/test_planner.py`: 経路計画の単体テスト
@@ -74,6 +75,22 @@ python main.py --source 0
 - `Q`または`Esc`: STOPを送って終了する
 
 送信を有効にする前に、必ず`config.json`の`udp.robot_ip`を実機のIPアドレスへ変更します。
+
+## カメラなしの機体側走行テスト
+
+オンボード側の`13_WiFi_UDP_Gyro_PD_Controller`を書き込み、画面に表示されたIPを`config.json`の`udp.robot_ip`へ設定します。まず車輪を浮かせ、送信しないプレビューを確認します。
+
+```powershell
+.\.venv\Scripts\python.exe send_test_command.py forward
+```
+
+実際に1秒だけ低速前進指令を送る場合:
+
+```powershell
+.\.venv\Scripts\python.exe send_test_command.py forward --duration 1 --level 0.25 --pwm-limit 22 --execute
+```
+
+`forward / backward / left / right / cw / ccw / stop`を選べます。移動時間は最大3秒、指令値は最大0.5、PWM上限は28に制限され、終了時やCtrl+C時にはSTOPを5回送ります。このテストは`velocity_local`モードを使うため、カメラがなくても機体側ジャイロで開始方位を維持します。
 
 ## 安全条件
 

@@ -10,6 +10,8 @@ WiFiUDP udp;
 const char* wifiSsid = "CQ-WS-24Gnew";
 const char* wifiPassword = "00000000";
 const uint16_t udpListenPort = 5005;
+// PC側config.jsonのself_id / udp.robot_idと同じ値にする。
+const uint8_t robotId = 4;
 
 // ==================== 低速・方向別PWM設定 ====================
 // PCからpwm_limit=28が届く場合、実際の上限は前進28、後退20となる。
@@ -43,6 +45,7 @@ const uint32_t displayIntervalMs = 200;
 const uint32_t serialIntervalMs = 200;
 const uint32_t calibrationMs = 1500;
 const uint32_t wifiRetryIntervalMs = 3000;
+const uint32_t statusReplyIntervalMs = 200;
 const uint32_t defaultCommandTtlMs = 350;
 const uint32_t minimumCommandTtlMs = 100;
 const uint32_t maximumCommandTtlMs = 1000;
@@ -73,6 +76,7 @@ uint32_t lastControlMs = 0;
 uint32_t lastDisplayMs = 0;
 uint32_t lastSerialMs = 0;
 uint32_t lastWifiAttemptMs = 0;
+uint32_t lastStatusReplyMs = 0;
 uint32_t previousGyroUs = 0;
 
 bool armed = false;
@@ -142,6 +146,7 @@ void drawStatus() {
   }
   M5.Display.printf("UDP: %u  age:%lu\n", udpListenPort,
                     lastPacketMs == 0 ? 0UL : millis() - lastPacketMs);
+  M5.Display.printf("Robot ID: %u\n", robotId);
   M5.Display.printf("F/L/T: %.2f %.2f %.2f\n", requestedForward,
                     requestedLateral, requestedTurn);
   M5.Display.printf("Yaw/Tgt: %.1f %.1f\n", yawDeg, headingTargetYawDeg);
@@ -256,6 +261,28 @@ bool readJsonString(const char* json, const char* key, char* destination,
   return true;
 }
 
+void sendStatusReply(IPAddress remoteIp, uint16_t remotePort, uint32_t ackSeq,
+                     bool force) {
+  if (!udpStarted || remotePort == 0) return;
+  const uint32_t nowMs = millis();
+  if (!force && nowMs - lastStatusReplyMs < statusReplyIntervalMs) return;
+
+  char reply[320];
+  snprintf(
+      reply, sizeof(reply),
+      "{\"v\":1,\"type\":\"status\",\"robot_id\":%u,\"ack_seq\":%lu,"
+      "\"armed\":%s,\"wifi\":%s,\"udp\":%s,\"command_active\":%s,"
+      "\"yaw_deg\":%.2f,\"state\":\"%s\",\"ip\":\"%s\"}",
+      robotId, static_cast<unsigned long>(ackSeq), armed ? "true" : "false",
+      WiFi.status() == WL_CONNECTED ? "true" : "false",
+      udpStarted ? "true" : "false", commandActive ? "true" : "false",
+      yawDeg, stateReason, WiFi.localIP().toString().c_str());
+  udp.beginPacket(remoteIp, remotePort);
+  udp.write(reinterpret_cast<const uint8_t*>(reply), strlen(reply));
+  udp.endPacket();
+  lastStatusReplyMs = nowMs;
+}
+
 void flushUdpPackets() {
   while (udpStarted) {
     const int packetSize = udp.parsePacket();
@@ -266,6 +293,7 @@ void flushUdpPackets() {
 
 bool processMotionPacket(const char* json) {
   uint32_t version = 0;
+  uint32_t addressedRobotId = 0;
   uint32_t sequence = 0;
   uint32_t ttl = defaultCommandTtlMs;
   uint32_t pwmLimit = 0;
@@ -279,6 +307,14 @@ bool processMotionPacket(const char* json) {
   if (!readJsonUInt(json, "v", version) || version != 1 ||
       !readJsonString(json, "type", type, sizeof(type)) ||
       strcmp(type, "motion") != 0 ||
+      !readJsonUInt(json, "robot_id", addressedRobotId)) {
+    stopImmediately("INVALID PACKET");
+    return false;
+  }
+  // 他チーム・他ID宛てのブロードキャストや誤送信は無視する。
+  if (addressedRobotId != robotId) return false;
+
+  if (
       !readJsonString(json, "mode", mode, sizeof(mode)) ||
       !readJsonUInt(json, "seq", sequence) ||
       !readJsonUInt(json, "ttl_ms", ttl) ||
@@ -349,6 +385,8 @@ void receiveUdpPackets() {
   if (!udpStarted) return;
   int packetSize = 0;
   while ((packetSize = udp.parsePacket()) > 0) {
+    const IPAddress remoteIp = udp.remoteIP();
+    const uint16_t remotePort = udp.remotePort();
     if (packetSize >= static_cast<int>(packetBufferSize)) {
       while (udp.available()) udp.read();
       stopImmediately("PACKET TOO LARGE");
@@ -357,7 +395,28 @@ void receiveUdpPackets() {
     const int length = udp.read(packetBuffer, packetBufferSize - 1);
     if (length <= 0) continue;
     packetBuffer[length] = '\0';
-    processMotionPacket(packetBuffer);
+    uint32_t version = 0;
+    uint32_t sequence = 0;
+    uint32_t addressedRobotId = 0;
+    char type[16];
+    if (!readJsonUInt(packetBuffer, "v", version) || version != 1 ||
+        !readJsonUInt(packetBuffer, "seq", sequence) ||
+        !readJsonUInt(packetBuffer, "robot_id", addressedRobotId) ||
+        !readJsonString(packetBuffer, "type", type, sizeof(type))) {
+      stopImmediately("INVALID PACKET");
+      continue;
+    }
+    if (addressedRobotId != robotId) continue;
+    if (strcmp(type, "probe") == 0) {
+      sendStatusReply(remoteIp, remotePort, sequence, true);
+    } else if (strcmp(type, "motion") == 0) {
+      if (processMotionPacket(packetBuffer)) {
+        sendStatusReply(remoteIp, remotePort, sequence, false);
+      }
+    } else {
+      stopImmediately("UNKNOWN TYPE");
+      sendStatusReply(remoteIp, remotePort, sequence, true);
+    }
   }
 }
 
@@ -403,8 +462,11 @@ void updateMotorControl() {
     stopImmediately("WIFI LOST");
     return;
   }
-  if (!commandActive || lastPacketMs == 0 ||
-      nowMs - lastPacketMs > commandTtlMs) {
+  if (!commandActive || lastPacketMs == 0) {
+    stopImmediately("ARMED WAIT UDP");
+    return;
+  }
+  if (nowMs - lastPacketMs > commandTtlMs) {
     stopImmediately("UDP TIMEOUT");
     return;
   }
@@ -528,9 +590,11 @@ void setup() {
   WiFi.setSleep(false);
   WiFi.begin(wifiSsid, wifiPassword);
   lastWifiAttemptMs = millis();
-  disarm("PRESS A TO ARM");
+  disarm("AUTO CALIBRATE");
   drawStatus();
-  Serial.printf("UDP_CONTROLLER,ssid=%s,port=%u\n", wifiSsid, udpListenPort);
+  armAfterCalibration();
+  Serial.printf("UDP_CONTROLLER,id=%u,ssid=%s,port=%u\n", robotId, wifiSsid,
+                udpListenPort);
 }
 
 void loop() {

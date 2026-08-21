@@ -29,9 +29,16 @@
   "minimum_command": 0.22,
   "slowdown_distance_cm": 20.0,
   "pwm_limit": 28,
+  "network": {
+    "expected_pc_ssid": "CQ-WS-5Gnew"
+  },
   "udp": {
-    "robot_ip": "192.168.100.50",
+    "robot_id": 4,
+    "robot_ip": "auto",
     "robot_port": 5005,
+    "discovery_broadcasts": ["192.168.100.255", "255.255.255.255"],
+    "probe_hz": 2.0,
+    "status_timeout_ms": 1500,
     "send_hz": 20.0,
     "ttl_ms": 350
   },

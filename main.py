@@ -1,7 +1,7 @@
 """CQ Workshop BugC2: overhead ArUco mapping and conservative path control.
 
-The program starts with UDP transmission disabled. Press A in the preview window
-to start control and SPACE to send an emergency stop.
+The program starts with UDP transmission disabled. Press A in Windows Terminal
+or the preview window to start control and SPACE to send an emergency stop.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import json
 import math
 import os
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -36,6 +37,11 @@ except ImportError:
     psutil = None
 
 from planner import astar, simplify_path
+
+if os.name == "nt":
+    import msvcrt
+else:
+    msvcrt = None
 
 
 Point = tuple[float, float]
@@ -126,13 +132,126 @@ class MarkerTracker:
 
 class UdpSender:
     def __init__(self, config: dict[str, Any], enabled: bool):
-        self.address = (str(config["robot_ip"]), int(config["robot_port"]))
+        configured_ip = str(config["robot_ip"]).strip()
+        self.auto_discovery = configured_ip.lower() == "auto"
+        self.configured_ip = configured_ip
+        self.robot_port = int(config["robot_port"])
+        self.robot_id = int(config["robot_id"])
+        self.discovery_broadcasts = tuple(
+            str(value) for value in config.get(
+                "discovery_broadcasts", ["255.255.255.255"]
+            )
+        )
+        self.probe_period = 1.0 / max(0.2, float(config.get("probe_hz", 2.0)))
+        self.status_timeout = max(
+            0.5, float(config.get("status_timeout_ms", 1500)) / 1000.0
+        )
         self.period = 1.0 / max(1.0, float(config["send_hz"]))
         self.ttl_ms = int(config["ttl_ms"])
         self.enabled = enabled
         self.sequence = 0
         self.last_send = 0.0
+        self.last_probe = 0.0
+        self.last_status = 0.0
+        self.status: dict[str, Any] = {}
+        self.resolved_address: tuple[str, int] | None = (
+            None if self.auto_discovery else (configured_ip, self.robot_port)
+        )
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.socket.bind(("", 0))
+        self.socket.setblocking(False)
+
+    @property
+    def robot_connected(self) -> bool:
+        return (
+            self.last_status > 0.0
+            and time.monotonic() - self.last_status <= self.status_timeout
+        )
+
+    @property
+    def robot_armed(self) -> bool:
+        return self.robot_connected and bool(self.status.get("armed", False))
+
+    @property
+    def destination_text(self) -> str:
+        if self.resolved_address is None:
+            return f"AUTO (robot ID {self.robot_id})"
+        return f"{self.resolved_address[0]}:{self.resolved_address[1]}"
+
+    @property
+    def status_text(self) -> str:
+        if not self.robot_connected:
+            return f"WAIT ID:{self.robot_id}"
+        state = str(self.status.get("state", "UNKNOWN"))
+        armed = "ARMED" if self.robot_armed else "SAFE"
+        return f"{armed} {self.destination_text} {state}"
+
+    def _next_sequence(self) -> int:
+        self.sequence += 1
+        return self.sequence
+
+    def _send_packet(self, packet: dict[str, Any], address: tuple[str, int]) -> None:
+        payload = json.dumps(packet, separators=(",", ":")).encode("utf-8")
+        self.socket.sendto(payload, address)
+
+    def send_probe(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_probe < self.probe_period:
+            return
+        packet = {
+            "v": 1,
+            "type": "probe",
+            "seq": self._next_sequence(),
+            "sent_ms": int(time.time() * 1000),
+            "robot_id": self.robot_id,
+        }
+        if self.resolved_address is not None:
+            targets = (self.resolved_address,)
+        else:
+            targets = tuple(
+                (broadcast, self.robot_port) for broadcast in self.discovery_broadcasts
+            )
+        for target in targets:
+            self._send_packet(packet, target)
+        self.last_probe = now
+
+    def poll_status(self) -> None:
+        while True:
+            try:
+                payload, source = self.socket.recvfrom(1024)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            try:
+                status = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if (
+                status.get("v") != 1
+                or status.get("type") != "status"
+                or status.get("robot_id") != self.robot_id
+            ):
+                continue
+            if not self.auto_discovery and source[0] != self.configured_ip:
+                continue
+            self.resolved_address = (source[0], self.robot_port)
+            self.status = status
+            self.last_status = time.monotonic()
+
+    def maintain_link(self) -> None:
+        self.poll_status()
+        if (
+            self.auto_discovery
+            and self.resolved_address is not None
+            and self.last_status > 0.0
+            and time.monotonic() - self.last_status > self.status_timeout * 2.0
+        ):
+            self.resolved_address = None
+            self.status = {}
+        self.send_probe()
+        self.poll_status()
 
     def set_enabled(self, enabled: bool) -> None:
         if self.enabled and not enabled:
@@ -140,17 +259,19 @@ class UdpSender:
         self.enabled = enabled
 
     def send(self, command: MotionCommand, pwm_limit: int, force: bool = False) -> None:
-        if not self.enabled:
+        if not self.enabled and not (force and command.mode == "stop"):
+            return
+        if self.resolved_address is None:
             return
         now = time.monotonic()
         if not force and now - self.last_send < self.period:
             return
-        self.sequence += 1
         packet = {
             "v": 1,
             "type": "motion",
-            "seq": self.sequence,
+            "seq": self._next_sequence(),
             "sent_ms": int(time.time() * 1000),
+            "robot_id": self.robot_id,
             "ttl_ms": self.ttl_ms,
             "mode": command.mode,
             "forward": round(command.forward, 4),
@@ -161,8 +282,7 @@ class UdpSender:
             "pwm_limit": int(pwm_limit),
             "reason": command.reason,
         }
-        payload = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-        self.socket.sendto(payload, self.address)
+        self._send_packet(packet, self.resolved_address)
         self.last_send = now
 
     def send_stop(self, reason: str, force: bool = False) -> None:
@@ -514,6 +634,10 @@ def draw_scene(
         detected_ids = f"{detected_ids[:69]}..."
     lines = [
         (f"{state}  FPS:{fps:.1f}  IDs:{len(markers)}", state_color),
+        (
+            f"ROBOT: {sender.status_text}",
+            (0, 255, 0) if sender.robot_connected else (0, 165, 255),
+        ),
         (f"ARUCO IDs: {detected_ids}", (0, 255, 255)),
         (
             f"CMD f:{command.forward:+.2f} lat:{command.lateral:+.2f} "
@@ -521,7 +645,7 @@ def draw_scene(
             (255, 255, 255),
         ),
         (f"STATE: {command.reason}", (255, 255, 255)),
-        ("A: START  SPACE: stop  Q: quit", (255, 255, 255)),
+        ("Terminal/window A: START  SPACE: stop  Q: quit", (255, 255, 255)),
     ]
     for index, (text, color) in enumerate(lines):
         cv2.putText(
@@ -546,12 +670,118 @@ def open_capture(source: str):
     return capture
 
 
+def read_console_key() -> str | None:
+    """Read one Windows Terminal key without requiring Enter."""
+    if msvcrt is None or not msvcrt.kbhit():
+        return None
+    key = msvcrt.getwch()
+    if key in ("\x00", "\xe0"):
+        if msvcrt.kbhit():
+            msvcrt.getwch()
+        return None
+    return key
+
+
+def current_windows_ssid() -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        result = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in result.stdout.splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name.strip().upper() == "SSID":
+            return value.strip()
+    return None
+
+
+def wait_for_expected_network(expected_ssid: str) -> bool:
+    if not expected_ssid:
+        return True
+    current = current_windows_ssid()
+    if current is None:
+        print(f"Wi-Fi SSIDを取得できません。手動で{expected_ssid}を確認してください。")
+        return True
+    if current == expected_ssid:
+        print(f"Wi-Fi OK: {current}")
+        return True
+
+    print("=" * 68)
+    print(f"NETWORK WAIT: 現在のSSIDは {current}")
+    print(f"WindowsのWi-Fiを {expected_ssid} へ切り替えてください。")
+    print("接続を検出すると自動的にカメラへ接続します。Qで終了します。")
+    print("=" * 68)
+    last_reported = current
+    while True:
+        key = read_console_key()
+        if key is not None and key.lower() == "q":
+            return False
+        time.sleep(1.0)
+        current = current_windows_ssid()
+        if current == expected_ssid:
+            print(f"Wi-Fi OK: {current}")
+            return True
+        if current != last_reported:
+            print(f"NETWORK WAIT: 現在のSSIDは {current or '未接続'}")
+            last_reported = current
+
+
+def handle_control_key(
+    key: str | int | None,
+    sender: UdpSender,
+    command: MotionCommand,
+) -> bool:
+    """Apply a terminal/window key. Return True when the program should quit."""
+    if key is None or key == 255:
+        return False
+    if isinstance(key, int):
+        if key == 27:
+            return True
+        if not 0 <= key <= 0x10FFFF:
+            return False
+        key_text = chr(key)
+    else:
+        key_text = key
+    if key_text.lower() == "q":
+        return True
+    if key_text.lower() == "a":
+        if sender.enabled:
+            print("Control is already ARMED. Press SPACE to stop.")
+        elif not sender.robot_connected:
+            print("START rejected: robot_status_not_received")
+        elif not sender.robot_armed:
+            print(f"START rejected: robot_not_armed ({sender.status_text})")
+        elif command.mode != "velocity":
+            print(f"START rejected: {command.reason}")
+        else:
+            sender.set_enabled(True)
+            print("CONTROL STARTED: UDP transmission ARMED")
+        return False
+    if key_text == " ":
+        sender.send_stop("keyboard_emergency_stop", force=True)
+        sender.set_enabled(False)
+        print("Emergency stop sent; UDP disarmed")
+    return False
+
+
 def parse_arguments() -> argparse.Namespace:
     base = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=base / "config.json")
     parser.add_argument("--source", help="Override URL, video path, or camera index")
     parser.add_argument("--self-id", type=int, help="Override player marker ID")
+    parser.add_argument(
+        "--skip-network-check",
+        action="store_true",
+        help="Skip the Windows Wi-Fi SSID preflight (for video/USB tests).",
+    )
     return parser.parse_args()
 
 
@@ -560,6 +790,13 @@ def main() -> int:
     config = load_config(args.config.resolve())
     if args.self_id is not None:
         config["self_id"] = args.self_id
+        config["udp"]["robot_id"] = args.self_id
+    if int(config["udp"]["robot_id"]) != int(config["self_id"]):
+        print("設定エラー: udp.robot_id と self_id は同じ値にしてください。")
+        return 2
+    expected_ssid = str(config.get("network", {}).get("expected_pc_ssid", ""))
+    if not args.skip_network_check and not wait_for_expected_network(expected_ssid):
+        return 0
     source = str(args.source or config["stream_url"])
     detector = create_detector(str(config["aruco_dictionary"]))
     tracker = MarkerTracker(
@@ -576,7 +813,8 @@ def main() -> int:
     cv2.namedWindow("BugC2 ArUco Navigator", cv2.WINDOW_NORMAL)
     print(f"Stream: {source}")
     print(f"Self ID: {config['self_id']} / Goal ID: {config['goal_id']}")
-    print(f"UDP: {sender.address[0]}:{sender.address[1]} (starts {'ON' if sender.enabled else 'OFF'})")
+    print(f"UDP robot: {sender.destination_text} (control starts OFF)")
+    print("Robot discovery starts automatically. Press A in this terminal to start.")
 
     route: list[Point] = []
     target: Point | None = None
@@ -586,12 +824,26 @@ def main() -> int:
     last_frame_time = time.monotonic()
     fps = 0.0
     failed_reads = 0
+    previous_robot_connected = False
 
     try:
         while True:
+            sender.maintain_link()
+            if sender.robot_connected != previous_robot_connected:
+                if sender.robot_connected:
+                    print(f"ROBOT CONNECTED: {sender.status_text}")
+                else:
+                    print("ROBOT DISCONNECTED: waiting for status reply")
+                    if sender.enabled:
+                        sender.set_enabled(False)
+                        print("UDP control disarmed because robot status was lost")
+                previous_robot_connected = sender.robot_connected
+
             if not capture.isOpened():
                 command = MotionCommand(reason="stream_disconnected")
                 sender.send(command, int(config["pwm_limit"]), force=True)
+                if handle_control_key(read_console_key(), sender, command):
+                    break
                 time.sleep(0.5)
                 capture.release()
                 capture = open_capture(source)
@@ -603,6 +855,8 @@ def main() -> int:
                 failed_reads += 1
                 command = MotionCommand(reason="frame_lost")
                 sender.send(command, int(config["pwm_limit"]), force=True)
+                if handle_control_key(read_console_key(), sender, command):
+                    break
                 if failed_reads >= 20:
                     capture.release()
                 time.sleep(0.01)
@@ -699,21 +953,12 @@ def main() -> int:
                     2,
                 )
             cv2.imshow("BugC2 ArUco Navigator", display)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            window_key = cv2.waitKey(1) & 0xFF
+            console_key = read_console_key()
+            if handle_control_key(console_key, sender, command):
                 break
-            if key in (ord("a"), ord("A")):
-                if sender.enabled:
-                    print("Control is already ARMED. Press SPACE to stop.")
-                elif command.mode != "velocity":
-                    print(f"START rejected: {command.reason}")
-                else:
-                    sender.set_enabled(True)
-                    print("CONTROL STARTED: UDP transmission ARMED")
-            elif key == ord(" "):
-                sender.send_stop("keyboard_emergency_stop", force=True)
-                sender.set_enabled(False)
-                print("Emergency stop sent; UDP disarmed")
+            if handle_control_key(window_key, sender, command):
+                break
     except KeyboardInterrupt:
         pass
     finally:

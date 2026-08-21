@@ -14,6 +14,6 @@ if errorlevel 1 (
   ".venv\Scripts\python.exe" -m pip install -r requirements.txt || exit /b 1
 )
 
-echo [BugC2] Starting in WAIT A mode. Press A in the video window to start control.
+echo [BugC2] Starting in WAIT A mode. Press A in this terminal to start control.
 ".venv\Scripts\python.exe" main.py %*
 exit /b %errorlevel%

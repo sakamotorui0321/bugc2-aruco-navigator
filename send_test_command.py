@@ -25,15 +25,20 @@ MOTIONS = {
 }
 
 
-def load_default_ip() -> str:
+def load_defaults() -> tuple[str, int]:
     config_path = Path(__file__).resolve().with_name("config.json")
-    return str(json.loads(config_path.read_text(encoding="utf-8"))["udp"]["robot_ip"])
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return str(config["udp"]["robot_ip"]), int(config["udp"]["robot_id"])
+
+
+DEFAULT_ROBOT_IP, DEFAULT_ROBOT_ID = load_defaults()
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("motion", choices=MOTIONS)
-    parser.add_argument("--robot-ip", default=load_default_ip())
+    parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
+    parser.add_argument("--robot-id", type=int, default=DEFAULT_ROBOT_ID)
     parser.add_argument("--port", type=int, default=5005)
     parser.add_argument("--duration", type=float, default=1.0)
     parser.add_argument("--level", type=float, default=0.25)
@@ -52,15 +57,27 @@ def parse_arguments() -> argparse.Namespace:
         parser.error("--pwm-limit must be between 1 and 28")
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
+    if not 0 <= args.robot_id <= 49:
+        parser.error("--robot-id must be between 0 and 49")
+    if args.execute and args.robot_ip.lower() == "auto":
+        parser.error("--robot-ip is required when config.json uses auto discovery")
     return args
 
 
-def packet(sequence: int, forward: float, lateral: float, turn: float, pwm: int):
+def packet(
+    sequence: int,
+    robot_id: int,
+    forward: float,
+    lateral: float,
+    turn: float,
+    pwm: int,
+):
     return {
         "v": 1,
         "type": "motion",
         "seq": sequence,
         "sent_ms": int(time.time() * 1000),
+        "robot_id": robot_id,
         "ttl_ms": 350,
         "mode": "velocity_local",
         "forward": round(forward, 4),
@@ -83,7 +100,7 @@ def main() -> int:
     forward = direction[0] * args.level
     lateral = direction[1] * args.level
     turn = direction[2] * args.level
-    preview = packet(1, forward, lateral, turn, args.pwm_limit)
+    preview = packet(1, args.robot_id, forward, lateral, turn, args.pwm_limit)
     print(json.dumps(preview, ensure_ascii=False, indent=2))
     if not args.execute:
         print("DRY-RUN: add --execute only after lifting the wheels or clearing the field.")
@@ -104,13 +121,20 @@ def main() -> int:
             send_json(
                 sock,
                 address,
-                packet(sequence, forward, lateral, turn, args.pwm_limit),
+                packet(
+                    sequence,
+                    args.robot_id,
+                    forward,
+                    lateral,
+                    turn,
+                    args.pwm_limit,
+                ),
             )
             time.sleep(0.05)
     finally:
         for _ in range(5):
             sequence += 1
-            stop_packet = packet(sequence, 0.0, 0.0, 0.0, 0)
+            stop_packet = packet(sequence, args.robot_id, 0.0, 0.0, 0.0, 0)
             stop_packet["mode"] = "stop"
             stop_packet["reason"] = "camera_free_test_complete"
             send_json(sock, address, stop_packet)

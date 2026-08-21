@@ -509,8 +509,12 @@ def draw_scene(
 
     state = "CONTROL ARMED" if sender.enabled else "WAIT A"
     state_color = (0, 0, 255) if sender.enabled else (0, 255, 255)
+    detected_ids = ",".join(str(marker_id) for marker_id in sorted(markers)) or "none"
+    if len(detected_ids) > 72:
+        detected_ids = f"{detected_ids[:69]}..."
     lines = [
         (f"{state}  FPS:{fps:.1f}  IDs:{len(markers)}", state_color),
+        (f"ARUCO IDs: {detected_ids}", (0, 255, 255)),
         (
             f"CMD f:{command.forward:+.2f} lat:{command.lateral:+.2f} "
             f"turn:{command.turn:+.2f} err:{command.heading_error_deg:+.1f}",
@@ -569,6 +573,7 @@ def main() -> int:
     logger = CsvLogger(args.config.resolve().parent, config["logging"])
     process = psutil.Process(os.getpid()) if psutil is not None else None
     capture = open_capture(source)
+    cv2.namedWindow("BugC2 ArUco Navigator", cv2.WINDOW_NORMAL)
     print(f"Stream: {source}")
     print(f"Self ID: {config['self_id']} / Goal ID: {config['goal_id']}")
     print(f"UDP: {sender.address[0]}:{sender.address[1]} (starts {'ON' if sender.enabled else 'OFF'})")

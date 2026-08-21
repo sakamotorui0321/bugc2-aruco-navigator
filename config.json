@@ -33,8 +33,7 @@
     "robot_ip": "192.168.100.50",
     "robot_port": 5005,
     "send_hz": 20.0,
-    "ttl_ms": 350,
-    "enabled_at_start": false
+    "ttl_ms": 350
   },
   "logging": {
     "enabled": true,

@@ -1,7 +1,7 @@
 """CQ Workshop BugC2: overhead ArUco mapping and conservative path control.
 
-The program starts with UDP transmission disabled. Press E in the preview window
-to arm/disarm transmission and SPACE to send an emergency stop.
+The program starts with UDP transmission disabled. Press A in the preview window
+to start control and SPACE to send an emergency stop.
 """
 
 from __future__ import annotations
@@ -507,7 +507,7 @@ def draw_scene(
     if target is not None:
         cv2.circle(display, tuple(round(v) for v in target), 7, (0, 165, 255), 2)
 
-    state = "ARMED" if sender.enabled else "DRY-RUN"
+    state = "CONTROL ARMED" if sender.enabled else "WAIT A"
     state_color = (0, 0, 255) if sender.enabled else (0, 255, 255)
     lines = [
         (f"{state}  FPS:{fps:.1f}  IDs:{len(markers)}", state_color),
@@ -517,7 +517,7 @@ def draw_scene(
             (255, 255, 255),
         ),
         (f"STATE: {command.reason}", (255, 255, 255)),
-        ("E: arm/disarm  SPACE: stop  Q: quit", (255, 255, 255)),
+        ("A: START  SPACE: stop  Q: quit", (255, 255, 255)),
     ]
     for index, (text, color) in enumerate(lines):
         cv2.putText(
@@ -548,11 +548,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=base / "config.json")
     parser.add_argument("--source", help="Override URL, video path, or camera index")
     parser.add_argument("--self-id", type=int, help="Override player marker ID")
-    parser.add_argument(
-        "--enable-send",
-        action="store_true",
-        help="Start armed. Normally leave this off and press E after visual checks.",
-    )
     return parser.parse_args()
 
 
@@ -569,9 +564,8 @@ def main() -> int:
         float(config["static_marker_hold_seconds"]),
     )
     udp_config = config["udp"]
-    sender = UdpSender(
-        udp_config, bool(udp_config.get("enabled_at_start", False) or args.enable_send)
-    )
+    # 本番では必ず映像画面を確認してAを押した後にだけ送信を開始する。
+    sender = UdpSender(udp_config, False)
     logger = CsvLogger(args.config.resolve().parent, config["logging"])
     process = psutil.Process(os.getpid()) if psutil is not None else None
     capture = open_capture(source)
@@ -703,9 +697,14 @@ def main() -> int:
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if key == ord("e"):
-                sender.set_enabled(not sender.enabled)
-                print(f"UDP transmission: {'ARMED' if sender.enabled else 'OFF'}")
+            if key in (ord("a"), ord("A")):
+                if sender.enabled:
+                    print("Control is already ARMED. Press SPACE to stop.")
+                elif command.mode != "velocity":
+                    print(f"START rejected: {command.reason}")
+                else:
+                    sender.set_enabled(True)
+                    print("CONTROL STARTED: UDP transmission ARMED")
             elif key == ord(" "):
                 sender.send_stop("keyboard_emergency_stop", force=True)
                 sender.set_enabled(False)
